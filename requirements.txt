@@ -1,0 +1,5 @@
+asyncpraw
+discord.py
+python-dotenv
+Flask
+aiohttp

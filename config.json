@@ -1,0 +1,10 @@
+{
+  "check_interval_minutes": 60,
+  "channels": {
+    "858716411718139906": {
+      "subreddits": ["memes", "meme"],
+      "upvote_threshold": 50
+    }
+  },
+  "blacklist": ["спойлер", "токсичное_слово"]
+}
