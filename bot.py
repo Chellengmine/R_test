@@ -357,6 +357,30 @@ async def forcecheck(ctx):
     await check_reddit()
     await ctx.send("Проверка завершена.")
 
+# Команда для удаления сообщений (только для администраторов)
+@bot.command(name="удалить")
+@commands.has_permissions(administrator=True)
+async def delete_messages(ctx, amount: int):
+    """Удаляет указанное количество сообщений из канала"""
+    if amount < 1:
+        await ctx.send("⚠️ Укажи число больше 0.")
+        return
+
+    # +1, чтобы удалить и команду пользователя
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    await ctx.send(f"✅ Удалено {len(deleted)-1} сообщений.", delete_after=5)
+
+# Обработка ошибок (например, если нет прав)
+@delete_messages.error
+async def delete_messages_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("⛔ У тебя нет прав администратора для этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("⚠️ Использование: `!удалить <число>`")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("⚠️ Укажи правильное число.")
+
+
 # -------------------------
 # Run
 # -------------------------
