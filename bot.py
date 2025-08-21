@@ -9,14 +9,6 @@ import asyncpraw
 from pathlib import Path
 import traceback
 
-# в начале bot.py (после импортов)
-try:
-    from keep_alive import keep_alive
-    keep_alive()
-except Exception:
-    pass
-
-
 # Загрузка секретов
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -25,7 +17,7 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "script:RedditToDiscordBot:1.0 (by u/yourname)")
 
 # Конфиги
-CONFIG_PATH = "config.json"        # см. пример в шаге 3
+CONFIG_PATH = "config.json"
 SEEN_PATH = "seen_posts.json"
 
 # Загрузим конфиг
@@ -83,30 +75,32 @@ def title_has_blacklisted_word(title: str, blacklist):
             return True
     return False
 
-# Helper: получить максимально надежный URL картинки из submission
+# Helper: получить наиболее надежный URL картинки из submission (но не для видео)
 def extract_image_url(submission) -> str | None:
     """
     Возвращает URL картинки, если удается найти (gallery -> preview -> direct url).
-    Если не найдено — возвращает None.
+    Если не найдено или это видео — возвращает None.
     """
     try:
+        # Если это видео — не возвращаем превью как основное изображение (по требованию)
+        if getattr(submission, "is_video", False):
+            return None
+
         # 1) gallery (если это gallery)
-        if getattr(submission, "is_gallery", False):
-            try:
+        try:
+            if getattr(submission, "is_gallery", False):
                 items = getattr(submission, "gallery_data", {}).get("items", [])
                 media_meta = getattr(submission, "media_metadata", {}) or {}
                 if items and isinstance(items, list) and media_meta:
-                    # берём первую
                     media_id = items[0].get("media_id")
                     if media_id and media_meta.get(media_id):
                         mm = media_meta[media_id]
-                        # структура mm может иметь 's' -> {'u': url}
                         if isinstance(mm, dict) and mm.get("s"):
                             u = mm["s"].get("u")
                             if u:
                                 return str(u).replace("&amp;", "&")
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # 2) preview
         try:
@@ -130,14 +124,13 @@ def extract_image_url(submission) -> str | None:
             pass
 
     except Exception:
-        # на всякий случай логируем
         traceback.print_exc()
 
     return None
 
 # Инициализируем бота discord
 intents = discord.Intents.default()
-# Если планируешь команды, и хочешь, чтобы content команд работал — включи этот intent в Dev Portal.
+# Если ты используешь команды с message content — включи Intent в Dev Portal
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -220,28 +213,44 @@ async def check_reddit():
                         if title_has_blacklisted_word(title, blacklist):
                             continue
 
-                        # Получаем изображение (если есть)
+                        # Получаем изображение (если это НЕ видео)
                         image_url = extract_image_url(submission)
 
-                        # Формируем embed (без количества апвотов)
+                        # Формируем embed
                         embed = discord.Embed(
                             title=(title if title else "Ссылка на пост"),
                             url=f"https://reddit.com{getattr(submission, 'permalink', '')}",
-                            color=0xFF5700  # приятный оранжевый
+                            color=0xFF5700
                         )
-                        # Описание — краткая ссылка
-                        shortlink = f"https://redd.it/{sid}"
-                        embed.description = f"[Открыть на Reddit]({shortlink})"
 
-                        if image_url:
+                        shortlink = f"https://redd.it/{sid}"
+                        # Если это видео — даём ссылку и пометим как видео
+                        if getattr(submission, "is_video", False):
+                            embed.description = f"Видео пост — [Открыть на Reddit]({shortlink})"
+                        else:
+                            embed.description = f"[Открыть на Reddit]({shortlink})"
+
+                        # Добавляем изображение только если это не видео и вообще есть image_url
+                        if image_url and not getattr(submission, "is_video", False):
                             try:
                                 embed.set_image(url=image_url)
                             except Exception as e:
                                 print(f"Failed to set embed image for {sid}: {e}")
 
-                        # Отправляем только embed — чтобы Discord не рисовал автопредпросмотр ссылки
+                        # Отправляем embed
                         try:
-                            await channel.send(embed=embed)
+                            sent_msg = await channel.send(embed=embed)
+                            # Добавляем реакции (попытка, с обработкой ошибок прав/лимитов)
+                            try:
+                                await sent_msg.add_reaction("👍")
+                            except Exception as e:
+                                print(f"Warning: could not add 👍 reaction to message for {sid}: {e}")
+                            try:
+                                await sent_msg.add_reaction("👎")
+                            except Exception as e:
+                                print(f"Warning: could not add 👎 reaction to message for {sid}: {e}")
+
+                            # пометим как отправленное
                             SEEN.add(sid)
                         except Exception as e:
                             print(f"Failed to send embed to channel {channel_id}: {e}")
@@ -252,13 +261,11 @@ async def check_reddit():
 
             except Exception as e:
                 print(f"Error reading r/{sub}: {type(e).__name__}: {e}")
-                # Часто сетевые таймауты — просто логируем и идём дальше
                 continue
 
     # Сохраняем состояние после цикла
     save_seen()
     print("Check complete.")
-
 
 # Graceful shutdown: закрываем reddit сессию
 async def close_resources():
@@ -271,11 +278,10 @@ async def close_resources():
         pass
 
 @bot.command(name="forcecheck")
-@commands.is_owner()  # опционально: разрешить только владельцу бота
+@commands.is_owner()
 async def forcecheck(ctx):
     """Команда: форс-проверка сейчас"""
     await ctx.send("Запускаю проверку сейчас...")
-    # Запускаем одну итерацию проверки вручную
     await check_reddit()
     await ctx.send("Проверка завершена.")
 
@@ -283,7 +289,6 @@ async def forcecheck(ctx):
 try:
     bot.run(DISCORD_TOKEN)
 finally:
-    # Закрываем ресурсы (если бот завершится)
     try:
         asyncio.run(close_resources())
     except Exception:
