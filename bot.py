@@ -2,6 +2,7 @@
 import os
 import json
 import asyncio
+import sqlite3
 from dotenv import load_dotenv
 import discord
 from discord.ext import tasks, commands
@@ -9,65 +10,114 @@ import asyncpraw
 from pathlib import Path
 import traceback
 
-# Загрузка секретов
+# -------------------------
+# Настройки окружения
+# -------------------------
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "script:RedditToDiscordBot:1.0 (by u/yourname)")
 
+# Путь к каталогу с персистентным хранилищем (смонтируйте volume на /data в Railway)
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")  # можно переопределить в Variables
+SEEN_DB_FILENAME = os.getenv("SEEN_DB_FILENAME", "seen_posts.db")
+SEEN_DB_PATH = os.path.join(PERSIST_DIR, SEEN_DB_FILENAME)
+
+# Для совместимости: при отсутствии volume будет использоваться локальный JSON
+LOCAL_SEEN_PATH = "seen_posts.json"
+
 # Конфиги
 CONFIG_PATH = "config.json"
-SEEN_PATH = "seen_posts.json"
 
-# Загрузим конфиг
+# -------------------------
+# Загрузка конфигурации
+# -------------------------
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-# Загрузим/инициализируем seen posts (устойчиво к пустым/битым файлам)
-SEEN = set()
-if os.path.exists(SEEN_PATH):
-    try:
-        with open(SEEN_PATH, "r", encoding="utf-8") as f:
-            data = f.read().strip()
-            if data == "":
-                SEEN = set()
-            else:
-                parsed = json.loads(data)
-                if isinstance(parsed, list):
-                    SEEN = set(str(x) for x in parsed)
-                else:
-                    print(f"Warning: {SEEN_PATH} содержит не список, создаю бэкап и использую пустой набор.")
-                    os.rename(SEEN_PATH, SEEN_PATH + ".bak")
-                    SEEN = set()
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"Warning: не смог разобрать {SEEN_PATH}: {e}. Создаю бэкап и использую пустой набор.")
-        try:
-            os.rename(SEEN_PATH, SEEN_PATH + ".corrupt.bak")
-        except Exception:
-            pass
-        SEEN = set()
-else:
-    SEEN = set()
+CHECK_INTERVAL = CONFIG.get("check_interval_minutes", 60)
 
-def save_seen():
-    """
-    Атомарно сохраняет список отправленных ID постов.
-    """
-    tmp = SEEN_PATH + ".tmp"
+# -------------------------
+# Helpers: SQLite-backed seen storage
+# -------------------------
+use_sqlite = False
+sqlite_conn = None
+SEEN = set()
+
+def init_sqlite_db(db_path: str):
+    global sqlite_conn, use_sqlite
     try:
+        # создаём директорию, если нужно
+        Path(os.path.dirname(db_path) or ".").mkdir(parents=True, exist_ok=True)
+        sqlite_conn = sqlite3.connect(db_path, check_same_thread=False)
+        sqlite_conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen_posts (id TEXT PRIMARY KEY, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        sqlite_conn.commit()
+        use_sqlite = True
+        print(f"Using SQLite DB for persistence at: {db_path}")
+    except Exception as e:
+        print(f"Failed to init sqlite at {db_path}: {e}")
+        sqlite_conn = None
+        use_sqlite = False
+
+def load_seen_from_sqlite():
+    global SEEN, sqlite_conn
+    if not sqlite_conn:
+        return
+    try:
+        cur = sqlite_conn.execute("SELECT id FROM seen_posts")
+        rows = cur.fetchall()
+        SEEN = set(row[0] for row in rows if row and row[0])
+        print(f"Loaded {len(SEEN)} seen ids from SQLite.")
+    except Exception as e:
+        print("Error loading seen from sqlite:", e)
+
+def add_seen_to_sqlite(sid: str):
+    global sqlite_conn
+    if not sqlite_conn:
+        return
+    try:
+        sqlite_conn.execute("INSERT OR IGNORE INTO seen_posts (id) VALUES (?)", (sid,))
+        sqlite_conn.commit()
+    except Exception as e:
+        print(f"Error inserting seen id {sid} into sqlite: {e}")
+
+# Fallback file-based storage (for local dev / if no volume)
+def load_seen_from_file(path: str):
+    global SEEN
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read().strip()
+                if data == "":
+                    SEEN = set()
+                else:
+                    parsed = json.loads(data)
+                    if isinstance(parsed, list):
+                        SEEN = set(str(x) for x in parsed)
+                    else:
+                        print(f"Warning: {path} содержит не список — игнорирую.")
+                        SEEN = set()
+        except Exception as e:
+            print("Failed to load seen from file:", e)
+            SEEN = set()
+    else:
+        SEEN = set()
+
+def save_seen_to_file(path: str):
+    try:
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(list(SEEN), f, ensure_ascii=False, indent=2)
-        os.replace(tmp, SEEN_PATH)
+        os.replace(tmp, path)
     except Exception as e:
-        print("Failed to save seen posts:", e)
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
+        print("Failed to save seen file:", e)
 
-# Помощник: проверка на совпадение с блэклистом
+# -------------------------
+# Image extraction and utilities (как раньше)
+# -------------------------
 def title_has_blacklisted_word(title: str, blacklist):
     title_lower = title.lower()
     for word in blacklist:
@@ -75,18 +125,11 @@ def title_has_blacklisted_word(title: str, blacklist):
             return True
     return False
 
-# Helper: получить наиболее надежный URL картинки из submission (но не для видео)
 def extract_image_url(submission) -> str | None:
-    """
-    Возвращает URL картинки, если удается найти (gallery -> preview -> direct url).
-    Если не найдено или это видео — возвращает None.
-    """
     try:
-        # Если это видео — не возвращаем превью как основное изображение (по требованию)
         if getattr(submission, "is_video", False):
             return None
-
-        # 1) gallery (если это gallery)
+        # gallery
         try:
             if getattr(submission, "is_gallery", False):
                 items = getattr(submission, "gallery_data", {}).get("items", [])
@@ -102,7 +145,7 @@ def extract_image_url(submission) -> str | None:
         except Exception:
             pass
 
-        # 2) preview
+        # preview
         try:
             preview = getattr(submission, "preview", None)
             if preview and isinstance(preview, dict):
@@ -115,7 +158,7 @@ def extract_image_url(submission) -> str | None:
         except Exception:
             pass
 
-        # 3) прямой url, если это изображение по расширению
+        # direct url
         try:
             url = getattr(submission, "url", "") or ""
             if isinstance(url, str) and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
@@ -125,37 +168,68 @@ def extract_image_url(submission) -> str | None:
 
     except Exception:
         traceback.print_exc()
-
     return None
 
-# Инициализируем бота discord
+# -------------------------
+# Discord bot init
+# -------------------------
 intents = discord.Intents.default()
-# Если ты используешь команды с message content — включи Intent в Dev Portal
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# reddit-клиент будет создан в on_ready (чтобы работать в event loop)
+# reddit placeholder (инициализируем в on_ready)
 reddit = None
 
-CHECK_INTERVAL = CONFIG.get("check_interval_minutes", 60)
+# -------------------------
+# Startup: choose persistence backend
+# -------------------------
+def prepare_persistence():
+    """
+    Если директория PERSIST_DIR доступна и мы можем создать файл внутри — используем sqlite в PERSIST_DIR.
+    Иначе — fallback на локальный JSON.
+    """
+    # Проверим, можно ли писать в PERSIST_DIR
+    try:
+        Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+        test_path = Path(PERSIST_DIR) / ".persist_test"
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        test_path.unlink(missing_ok=True)
+        # Инициализируем sqlite
+        init_sqlite_db(SEEN_DB_PATH)
+        if use_sqlite:
+            load_seen_from_sqlite()
+            return
+    except Exception as e:
+        print(f"Persistence dir not usable ({PERSIST_DIR}): {e}")
 
+    # fallback
+    print("Using local JSON fallback for seen storage.")
+    load_seen_from_file(LOCAL_SEEN_PATH)
+
+# -------------------------
+# Bot events and main loop
+# -------------------------
 @bot.event
 async def on_ready():
     global reddit
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Создаём asyncpraw клиент внутри event loop (важно)
+    # Prepare persistence (DB or JSON)
+    prepare_persistence()
+
+    # Инициализация asyncpraw внутри event loop
     try:
         reddit = asyncpraw.Reddit(
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT
         )
+        print("Initialized asyncpraw Reddit client.")
     except Exception as e:
-        print("Failed to initialize asyncpraw Reddit client in on_ready:", e)
+        print("Failed to initialize asyncpraw:", e)
         reddit = None
 
-    # Запускаем цикл
     check_reddit.start()
     print("Started reddit-check loop.")
 
@@ -167,7 +241,6 @@ async def check_reddit():
     channels_cfg = CONFIG.get("channels", {})
 
     if reddit is None:
-        # Попытка создать заново, если по какой-то причине не создался ранее
         try:
             reddit = asyncpraw.Reddit(
                 client_id=REDDIT_CLIENT_ID,
@@ -196,7 +269,6 @@ async def check_reddit():
 
         for sub in subreddits:
             try:
-                # Правильно: await для asyncpraw
                 subreddit = await reddit.subreddit(sub)
 
                 async for submission in subreddit.new(limit=25):
@@ -207,51 +279,47 @@ async def check_reddit():
 
                         title = submission.title or ""
                         score = getattr(submission, "score", 0)
-                        # фильтры
                         if score < upvote_threshold:
                             continue
                         if title_has_blacklisted_word(title, blacklist):
                             continue
 
-                        # Получаем изображение (если это НЕ видео)
                         image_url = extract_image_url(submission)
-
-                        # Формируем embed
                         embed = discord.Embed(
                             title=(title if title else "Ссылка на пост"),
                             url=f"https://reddit.com{getattr(submission, 'permalink', '')}",
                             color=0xFF5700
                         )
-
                         shortlink = f"https://redd.it/{sid}"
-                        # Если это видео — даём ссылку и пометим как видео
                         if getattr(submission, "is_video", False):
                             embed.description = f"Видео пост — [Открыть на Reddit]({shortlink})"
                         else:
                             embed.description = f"[Открыть на Reddit]({shortlink})"
 
-                        # Добавляем изображение только если это не видео и вообще есть image_url
                         if image_url and not getattr(submission, "is_video", False):
                             try:
                                 embed.set_image(url=image_url)
                             except Exception as e:
                                 print(f"Failed to set embed image for {sid}: {e}")
 
-                        # Отправляем embed
                         try:
                             sent_msg = await channel.send(embed=embed)
-                            # Добавляем реакции (попытка, с обработкой ошибок прав/лимитов)
+                            # реакции
                             try:
                                 await sent_msg.add_reaction("👍")
                             except Exception as e:
-                                print(f"Warning: could not add 👍 reaction to message for {sid}: {e}")
+                                print(f"Warning: could not add 👍 reaction for {sid}: {e}")
                             try:
                                 await sent_msg.add_reaction("👎")
                             except Exception as e:
-                                print(f"Warning: could not add 👎 reaction to message for {sid}: {e}")
+                                print(f"Warning: could not add 👎 reaction for {sid}: {e}")
 
-                            # пометим как отправленное
+                            # отметим как отправленное и запишем в persistence
                             SEEN.add(sid)
+                            if use_sqlite:
+                                add_seen_to_sqlite(sid)
+                            else:
+                                save_seen_to_file(LOCAL_SEEN_PATH)
                         except Exception as e:
                             print(f"Failed to send embed to channel {channel_id}: {e}")
 
@@ -263,29 +331,35 @@ async def check_reddit():
                 print(f"Error reading r/{sub}: {type(e).__name__}: {e}")
                 continue
 
-    # Сохраняем состояние после цикла
-    save_seen()
     print("Check complete.")
 
-# Graceful shutdown: закрываем reddit сессию
+# -------------------------
+# Graceful shutdown
+# -------------------------
 async def close_resources():
-    global reddit
+    global reddit, sqlite_conn
     try:
         if reddit is not None:
             await reddit.close()
             reddit = None
     except Exception:
         pass
+    try:
+        if sqlite_conn is not None:
+            sqlite_conn.close()
+    except Exception:
+        pass
 
 @bot.command(name="forcecheck")
 @commands.is_owner()
 async def forcecheck(ctx):
-    """Команда: форс-проверка сейчас"""
     await ctx.send("Запускаю проверку сейчас...")
     await check_reddit()
     await ctx.send("Проверка завершена.")
 
-# Запуск
+# -------------------------
+# Run
+# -------------------------
 try:
     bot.run(DISCORD_TOKEN)
 finally:
