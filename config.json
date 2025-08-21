@@ -1,10 +1,14 @@
 {
   "check_interval_minutes": 60,
   "channels": {
-    "858716411718139906": {
-      "subreddits": ["memes", "meme"],
-      "upvote_threshold": 50
+    "1402314919558516757": {
+      "subreddits": ["memes", "meme", "meirl"],
+      "upvote_threshold": 100
+    },
+    "1408052953306370138": {
+      "subreddits": ["shittyrainbow6"],
+      "upvote_threshold": 20
     }
   },
-  "blacklist": ["спойлер", "токсичное_слово"]
+  "blacklist": ["spoiler", "токсичное_слово"]
 }
