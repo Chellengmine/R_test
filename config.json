@@ -3,11 +3,11 @@
   "channels": {
     "1402314919558516757": {
       "subreddits": ["memes", "meme", "meirl"],
-      "upvote_threshold": 300
+      "upvote_threshold": 1000
     },
     "1408052953306370138": {
       "subreddits": ["shittyrainbow6"],
-      "upvote_threshold": 20
+      "upvote_threshold": 50
     }
   },
   "blacklist": ["spoiler", "токсичное_слово"]
